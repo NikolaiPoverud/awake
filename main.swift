@@ -148,24 +148,63 @@ final class Model: ObservableObject {
     }
 }
 
+// MARK: - Ops status (the agent dashboard, ~/.claude/ops/dashboard/server.py)
+
+struct OpsStatus: Decodable {
+    struct Agent: Decodable { let name: String; let health: String; let progress: Double?; let done_today: Int }
+    struct Decisions: Decodable { struct Old: Decodable { let age_days: Int }; let count: Int; let oldest: [Old] }
+    struct Runner: Decodable { let ok: Bool; let age_min: Int? }
+    struct Triage: Decodable { let on: Bool }
+    struct Jobs: Decodable { let failing: [String]? }
+    let agents: [Agent]; let decisions: Decisions; let runner: Runner; let triage: Triage; let jobs: Jobs
+}
+
+let opsURL = URL(string: "http://127.0.0.1:8788/")!
+
+final class Ops: ObservableObject {
+    @Published private(set) var status: OpsStatus?
+    @Published private(set) var offline = false
+    var onChange: (() -> Void)?
+
+    func refresh() {
+        var req = URLRequest(url: opsURL.appendingPathComponent("api/status"))
+        req.timeoutInterval = 4
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            let s = (resp as? HTTPURLResponse)?.statusCode == 200 ? data.flatMap { try? JSONDecoder().decode(OpsStatus.self, from: $0) } : nil
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.offline = s == nil           // a bad answer shows "offline", never stale numbers as fresh
+                if let s { self.status = s } else { self.status = nil }
+                self.onChange?()
+            }
+        }.resume()
+    }
+
+    var rows: Int { min(status?.agents.count ?? 0, 16) }
+}
+
 // MARK: - Notch panel
 
 final class Hover: ObservableObject {
+    @Published var openH: CGFloat = 176
     @Published var expanded = false
     @Published var notch = CGSize(width: 200, height: 32)
     @Published var hasNotch = false
 }
 
-let panelSize = CGSize(width: 380, height: 190)
-let openSize = CGSize(width: 360, height: 176)
+let openW: CGFloat = 400
+let baseH: CGFloat = 176      // the sleep controls
+let statusH: CGFloat = 54     // the two summary lines
+func opsHeight(_ ops: Ops) -> CGFloat { ops.status == nil ? 30 : statusH + CGFloat(ops.rows) * 18 + 6 }
 
 struct NotchView: View {
     @ObservedObject var m: Model
     @ObservedObject var h: Hover
+    @ObservedObject var ops: Ops
 
     var body: some View {
-        let w = h.expanded ? openSize.width : h.notch.width
-        let ht = h.expanded ? openSize.height : h.notch.height
+        let w = h.expanded ? openW : h.notch.width
+        let ht = h.expanded ? h.openH : h.notch.height
         let shape = UnevenRoundedRectangle(bottomLeadingRadius: h.expanded ? 26 : 10,
                                            bottomTrailingRadius: h.expanded ? 26 : 10, style: .continuous)
         // The content is clipped to the black shape, so it can never show without its background.
@@ -173,7 +212,7 @@ struct NotchView: View {
             Color.black
             if h.expanded {
                 content
-                    .frame(width: openSize.width - 40)
+                    .frame(width: openW - 40)
                     .padding(.top, max(h.notch.height, 12) + 8)
                     .transition(.asymmetric(
                         insertion: .opacity.animation(.easeOut(duration: 0.2).delay(0.08)),
@@ -185,14 +224,67 @@ struct NotchView: View {
         .shadow(color: .black.opacity(h.expanded ? 0.35 : 0), radius: 16, y: 6)
         .opacity(h.expanded || h.hasNotch ? 1 : 0)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .frame(width: panelSize.width, height: panelSize.height, alignment: .top)
+        .frame(width: openW + 20, height: h.openH + 20, alignment: .top)
         .animation(.spring(response: 0.38, dampingFraction: 0.82), value: h.expanded)
         .animation(.easeInOut(duration: 0.2), value: m.isOn)
         .preferredColorScheme(.dark)
     }
 
+    var opsView: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let s = ops.status {
+                let n = s.decisions.count, old = s.decisions.oldest.first?.age_days
+                HStack(spacing: 6) {
+                    Text(n == 0 ? "No decisions wait on you" : "\(n) decision\(n == 1 ? "" : "s") wait on you" + (old.map { $0 == 0 ? " (oldest today)" : " (oldest \($0) d)" } ?? ""))
+                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(n == 0 ? Color.green : .orange)
+                    Spacer()
+                    Text("open ›").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                let failing = s.jobs.failing?.count ?? 0
+                HStack(spacing: 12) {
+                    flag("Runner", s.runner.ok ? "OK" : "down", s.runner.ok)
+                    flag("Triage", s.triage.on ? "on" : "off", s.triage.on)
+                    flag("Jobs", s.jobs.failing == nil ? "?" : failing == 0 ? "OK" : "\(failing) failing", s.jobs.failing != nil && failing == 0)
+                    Spacer()
+                }
+                .padding(.bottom, 2)
+                ForEach(Array(s.agents.prefix(16).enumerated()), id: \.offset) { _, a in
+                    HStack(spacing: 6) {
+                        Circle().fill(color(a.health)).frame(width: 7, height: 7)
+                        Text(a.name).font(.system(size: 11)).lineLimit(1).frame(width: 130, alignment: .leading)
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.white.opacity(0.12))
+                            GeometryReader { g in Capsule().fill(color(a.health)).frame(width: g.size.width * CGFloat(a.progress ?? 0)) }
+                        }.frame(height: 4)
+                        Text(a.progress.map { "\(Int($0 * 100))%" } ?? "n/a").font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 32, alignment: .trailing)
+                        Text("\(a.done_today) today").font(.system(size: 10)).foregroundStyle(a.done_today > 0 ? .white : .secondary).frame(width: 52, alignment: .trailing)
+                    }.frame(height: 18)
+                }
+            } else {
+                Text(ops.offline ? "Ops dashboard offline (127.0.0.1:8788)" : "Reading ops status...")
+                    .font(.system(size: 12)).foregroundStyle(ops.offline ? Color.red : .secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture { NSWorkspace.shared.open(opsURL) }
+    }
+
+    func color(_ health: String) -> Color {
+        switch health { case "earning": return .green; case "quiet": return .yellow; case "stuck", "error": return .red; default: return .gray }
+    }
+
+    func flag(_ title: String, _ value: String, _ ok: Bool) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(ok ? Color.green : .red).frame(width: 6, height: 6)
+            Text("\(title) \(value)").font(.system(size: 11)).foregroundStyle(.secondary)
+        }
+    }
+
     var content: some View {
         VStack(spacing: 14) {
+            opsView
+            Divider().overlay(Color.white.opacity(0.15))
             HStack(spacing: 14) {
                 Button(action: m.toggle) {
                     Image(systemName: m.isOn ? "cup.and.saucer.fill" : "cup.and.saucer")
@@ -252,6 +344,8 @@ final class Panel: NSPanel {
 final class App: NSObject, NSApplicationDelegate {
     let model = Model()
     let hover = Hover()
+    let ops = Ops()
+    var opsTimer: Timer?
     var panel: Panel!
     var screen: NSScreen?
     var closeWork: DispatchWorkItem?
@@ -265,7 +359,8 @@ final class App: NSObject, NSApplicationDelegate {
         panel.isOpaque = false
         panel.hasShadow = false
         panel.ignoresMouseEvents = true
-        panel.contentView = NSHostingView(rootView: NotchView(m: model, h: hover))
+        panel.contentView = NSHostingView(rootView: NotchView(m: model, h: hover, ops: ops))
+        ops.onChange = { [weak self] in self?.resize() }
         place(on: NSScreen.main ?? NSScreen.screens[0])
         panel.orderFrontRegardless()
 
@@ -287,8 +382,14 @@ final class App: NSObject, NSApplicationDelegate {
         hover.notch = hover.hasNotch ? CGSize(width: s.frame.width - left - right, height: s.safeAreaInsets.top)
                                      : CGSize(width: 200, height: 0)
         let f = s.frame
-        panel.setFrame(NSRect(x: f.midX - panelSize.width / 2, y: f.maxY - panelSize.height,
-                              width: panelSize.width, height: panelSize.height), display: true)
+        panel.setFrame(NSRect(x: f.midX - (openW + 20) / 2, y: f.maxY - (hover.openH + 20),
+                              width: openW + 20, height: hover.openH + 20), display: true)
+    }
+
+    // The panel grows with the agent list. The window is resized with it so it never blocks clicks below.
+    func resize() {
+        hover.openH = baseH + opsHeight(ops) + 48
+        place(on: screen ?? NSScreen.main ?? NSScreen.screens[0])
     }
 
     func track() {
@@ -298,8 +399,8 @@ final class App: NSObject, NSApplicationDelegate {
         guard let s = NSScreen.screens.first(where: { NSMouseInRect(p, $0.frame, false) }) else { return }
         let f = s.frame
         if hover.expanded {
-            let open = NSRect(x: f.midX - openSize.width / 2 - 16, y: f.maxY - openSize.height - 16,
-                              width: openSize.width + 32, height: openSize.height + 16)
+            let open = NSRect(x: f.midX - openW / 2 - 16, y: f.maxY - hover.openH - 16,
+                              width: openW + 32, height: hover.openH + 16)
             if NSMouseInRect(p, open, false) { closeWork?.cancel(); closeWork = nil }
             else if closeWork == nil {
                 let w = DispatchWorkItem { [weak self] in self?.setExpanded(false) }
@@ -319,6 +420,11 @@ final class App: NSObject, NSApplicationDelegate {
         guard hover.expanded != on else { return }
         hover.expanded = on
         panel.ignoresMouseEvents = !on
+        opsTimer?.invalidate(); opsTimer = nil
+        if on {
+            ops.refresh()
+            opsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.ops.refresh() }
+        }
     }
 }
 
