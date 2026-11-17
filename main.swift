@@ -282,10 +282,10 @@ struct NotchView: View {
                     .frame(height: 18)
                     .contentShape(Rectangle())
                     .onHover { inside in h.rowWork?.cancel()
-                        if inside {   // second level only after the pointer rests 600 ms on the row
+                        if inside {   // second level only after the pointer rests 400 ms on the row
                             let w = DispatchWorkItem { h.hovered = a.name }
                             h.rowWork = w
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: w)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: w)
                         } else if h.hovered == a.name { h.hovered = nil } }
                 }
                 detail(s)
@@ -412,8 +412,7 @@ final class App: NSObject, NSApplicationDelegate {
             guard let self, !self.hover.expanded else { return }
             let p = NSEvent.mouseLocation
             if let s = NSScreen.screens.first(where: { NSMouseInRect(p, $0.frame, false) }) {
-                let hotW = self.hover.notch.width + 20, hotH = max(self.hover.notch.height, 4)
-                if NSMouseInRect(p, NSRect(x: s.frame.midX - hotW / 2, y: s.frame.maxY - hotH, width: hotW, height: hotH + 1), false) { self.setExpanded(true, why: "click") }
+                if NSMouseInRect(p, self.hotRect(s.frame), false) { self.setExpanded(true, why: "click") }
             }
         }
         ops.refresh()
@@ -449,6 +448,12 @@ final class App: NSObject, NSApplicationDelegate {
         place(on: screen ?? NSScreen.main ?? NSScreen.screens[0])
     }
 
+    // The notch width plus 40 px each side, and the top 8 px of the screen under the notch.
+    func hotRect(_ f: NSRect) -> NSRect {
+        let w = hover.notch.width + 80, h = max(hover.notch.height, 4) + 8
+        return NSRect(x: f.midX - w / 2, y: f.maxY - h, width: w, height: h + 1)
+    }
+
     func track() {
         let p = NSEvent.mouseLocation
         guard let s = NSScreen.screens.first(where: { NSMouseInRect(p, $0.frame, false) }) else { return }
@@ -456,17 +461,21 @@ final class App: NSObject, NSApplicationDelegate {
         if hover.expanded {
             let open = NSRect(x: f.midX - openW / 2 - 16, y: f.maxY - hover.openH - 16,
                               width: openW + 32, height: hover.openH + 16)
-            if NSMouseInRect(p, open, false) { closeWork?.cancel(); closeWork = nil }
-            else { setExpanded(false) }   // closes at once when the pointer leaves
+            // Stays open while the pointer is over the notch zone or the panel. Closes 300 ms after it leaves both.
+            if NSMouseInRect(p, open, false) || NSMouseInRect(p, hotRect(f), false) { closeWork?.cancel(); closeWork = nil }
+            else if closeWork == nil {
+                let w = DispatchWorkItem { [weak self] in self?.setExpanded(false) }
+                closeWork = w
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: w)
+            }
         } else {
             if s != screen { place(on: s) }
-            let hotW = hover.notch.width + 20, hotH = max(hover.notch.height, 4)
-            let hot = NSRect(x: f.midX - hotW / 2, y: f.maxY - hotH, width: hotW, height: hotH + 1)
-            // Opens only after the pointer rests 600 ms in the notch. A pass-through never opens it. A click is the second trigger.
+            let hot = hotRect(f)
+            // Opens only after the pointer rests 300 ms in the notch zone. A pass-through never opens it. A click is the second trigger.
             if NSMouseInRect(p, hot, false) {
                 let t0 = dwellStart ?? Date()
                 dwellStart = t0
-                if Date().timeIntervalSince(t0) >= 0.6 { setExpanded(true, why: "rest-600ms") }
+                if Date().timeIntervalSince(t0) >= 0.3 { setExpanded(true, why: "rest-300ms") }
             } else { dwellStart = nil }
         }
     }
@@ -480,7 +489,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     func setExpanded(_ on: Bool, why: String = "") {
-        dwellStart = nil
+        dwellStart = nil; closeWork?.cancel(); closeWork = nil
         guard hover.expanded != on else { return }
         if on { logOpen(why) }
         hover.expanded = on
