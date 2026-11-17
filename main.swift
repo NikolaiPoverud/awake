@@ -151,10 +151,10 @@ final class Model: ObservableObject {
 // MARK: - Ops status (the agent dashboard, ~/.claude/ops/dashboard/server.py)
 
 struct OpsStatus: Decodable {
-    struct Agent: Decodable { let name: String; let health: String; let progress: Double?; let done_today: Int }
-    struct Decisions: Decodable { struct Old: Decodable { let age_days: Int }; let count: Int; let oldest: [Old] }
+    struct Agent: Decodable { let name: String; let health: String; let progress: Double?; let done_today: Int; let next: String?; let waiting_on: [String]? }
+    struct Decisions: Decodable { struct Old: Decodable { let age_days: Int; let id: String?; let title: String? }; let count: Int; let oldest: [Old] }
     struct Runner: Decodable { let ok: Bool; let age_min: Int? }
-    struct Triage: Decodable { let on: Bool }
+    struct Triage: Decodable { let on: Bool; let stale: Bool? }
     struct Jobs: Decodable { let failing: [String]? }
     let agents: [Agent]; let decisions: Decisions; let runner: Runner; let triage: Triage; let jobs: Jobs
 }
@@ -180,6 +180,15 @@ final class Ops: ObservableObject {
         }.resume()
     }
 
+    // orange: a decision older than 24 h or a stuck agent. red: runner down, triage should run but does not, or no answer at all.
+    enum Alert { case none, orange, red }
+    var alert: Alert {
+        guard let s = status else { return offline ? .red : .none }
+        if !s.runner.ok || s.triage.stale == true { return .red }
+        if (s.decisions.oldest.first?.age_days ?? 0) >= 1 || s.agents.contains(where: { $0.health == "stuck" }) { return .orange }
+        return .none
+    }
+
     var rows: Int { min(status?.agents.count ?? 0, 16) }
 }
 
@@ -187,6 +196,8 @@ final class Ops: ObservableObject {
 
 final class Hover: ObservableObject {
     @Published var openH: CGFloat = 176
+    @Published var hovered: String?
+    var rowWork: DispatchWorkItem?
     @Published var expanded = false
     @Published var notch = CGSize(width: 200, height: 32)
     @Published var hasNotch = false
@@ -195,12 +206,14 @@ final class Hover: ObservableObject {
 let openW: CGFloat = 400
 let baseH: CGFloat = 176      // the sleep controls
 let statusH: CGFloat = 54     // the two summary lines
-func opsHeight(_ ops: Ops) -> CGFloat { ops.status == nil ? 30 : statusH + CGFloat(ops.rows) * 18 + 6 }
+let detailH: CGFloat = 52     // second-level detail under the list
+func opsHeight(_ ops: Ops) -> CGFloat { ops.status == nil ? 30 : statusH + CGFloat(ops.rows) * 18 + 6 + detailH }
 
 struct NotchView: View {
     @ObservedObject var m: Model
     @ObservedObject var h: Hover
     @ObservedObject var ops: Ops
+    let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
 
     var body: some View {
         let w = h.expanded ? openW : h.notch.width
@@ -221,12 +234,19 @@ struct NotchView: View {
         }
         .frame(width: w, height: ht, alignment: .top)
         .clipShape(shape)
+        .overlay(alignment: .top) {
+            // A thin line under the collapsed notch. Static, so reduce motion needs nothing.
+            if !h.expanded, h.hasNotch, ops.alert != .none {
+                Capsule().fill(ops.alert == .red ? Color.red : Color.orange).opacity(0.85)
+                    .frame(width: h.notch.width * 0.7, height: 2).offset(y: h.notch.height + 1)
+            }
+        }
         .shadow(color: .black.opacity(h.expanded ? 0.35 : 0), radius: 16, y: 6)
         .opacity(h.expanded || h.hasNotch ? 1 : 0)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .frame(width: openW + 20, height: h.openH + 20, alignment: .top)
-        .animation(.spring(response: 0.38, dampingFraction: 0.82), value: h.expanded)
-        .animation(.easeInOut(duration: 0.2), value: m.isOn)
+        .animation(reduceMotion ? nil : .spring(response: 0.38, dampingFraction: 0.82), value: h.expanded)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: m.isOn)
         .preferredColorScheme(.dark)
     }
 
@@ -258,8 +278,17 @@ struct NotchView: View {
                         }.frame(height: 4)
                         Text(a.progress.map { "\(Int($0 * 100))%" } ?? "n/a").font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 32, alignment: .trailing)
                         Text("\(a.done_today) today").font(.system(size: 10)).foregroundStyle(a.done_today > 0 ? .white : .secondary).frame(width: 52, alignment: .trailing)
-                    }.frame(height: 18)
+                    }
+                    .frame(height: 18)
+                    .contentShape(Rectangle())
+                    .onHover { inside in h.rowWork?.cancel()
+                        if inside {   // second level only after the pointer rests 600 ms on the row
+                            let w = DispatchWorkItem { h.hovered = a.name }
+                            h.rowWork = w
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: w)
+                        } else if h.hovered == a.name { h.hovered = nil } }
                 }
+                detail(s)
             } else {
                 Text(ops.offline ? "Ops dashboard offline (127.0.0.1:8788)" : "Reading ops status...")
                     .font(.system(size: 12)).foregroundStyle(ops.offline ? Color.red : .secondary)
@@ -268,6 +297,24 @@ struct NotchView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onTapGesture { NSWorkspace.shared.open(opsURL) }
+    }
+
+    // Second level: the oldest 3 decisions, or the next action and the wait of the hovered agent.
+    func detail(_ s: OpsStatus) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let name = h.hovered, let a = s.agents.first(where: { $0.name == name }) {
+                Text("Next: " + ((a.next ?? "").isEmpty ? "none queued" : a.next!)).lineLimit(2)
+                Text("Waiting on: " + ((a.waiting_on ?? []).isEmpty ? "nobody" : a.waiting_on!.joined(separator: ", "))).lineLimit(1)
+            } else {
+                ForEach(Array(s.decisions.oldest.prefix(3).enumerated()), id: \.offset) { _, d in
+                    Text("\(d.age_days) d  \(d.title ?? d.id ?? "")").lineLimit(1)
+                }
+                if s.decisions.oldest.isEmpty { Text("No open decisions") }
+            }
+        }
+        .font(.system(size: 10)).foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, minHeight: detailH - 8, maxHeight: detailH - 8, alignment: .topLeading)
+        .padding(.top, 6)
     }
 
     func color(_ health: String) -> Color {
@@ -349,7 +396,7 @@ final class App: NSObject, NSApplicationDelegate {
     var panel: Panel!
     var screen: NSScreen?
     var closeWork: DispatchWorkItem?
-    var last = NSPoint(x: -1, y: -1)
+    var dwellStart: Date?
 
     func applicationDidFinishLaunching(_: Notification) {
         panel = Panel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -361,6 +408,16 @@ final class App: NSObject, NSApplicationDelegate {
         panel.ignoresMouseEvents = true
         panel.contentView = NSHostingView(rootView: NotchView(m: model, h: hover, ops: ops))
         ops.onChange = { [weak self] in self?.resize() }
+        NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
+            guard let self, !self.hover.expanded else { return }
+            let p = NSEvent.mouseLocation
+            if let s = NSScreen.screens.first(where: { NSMouseInRect(p, $0.frame, false) }) {
+                let hotW = self.hover.notch.width + 20, hotH = max(self.hover.notch.height, 4)
+                if NSMouseInRect(p, NSRect(x: s.frame.midX - hotW / 2, y: s.frame.maxY - hotH, width: hotW, height: hotH + 1), false) { self.setExpanded(true, why: "click") }
+            }
+        }
+        ops.refresh()
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.ops.refresh() }  // keeps the collapsed tint fresh
         place(on: NSScreen.main ?? NSScreen.screens[0])
         panel.orderFrontRegardless()
 
@@ -394,30 +451,38 @@ final class App: NSObject, NSApplicationDelegate {
 
     func track() {
         let p = NSEvent.mouseLocation
-        if p == last { return }
-        last = p
         guard let s = NSScreen.screens.first(where: { NSMouseInRect(p, $0.frame, false) }) else { return }
         let f = s.frame
         if hover.expanded {
             let open = NSRect(x: f.midX - openW / 2 - 16, y: f.maxY - hover.openH - 16,
                               width: openW + 32, height: hover.openH + 16)
             if NSMouseInRect(p, open, false) { closeWork?.cancel(); closeWork = nil }
-            else if closeWork == nil {
-                let w = DispatchWorkItem { [weak self] in self?.setExpanded(false) }
-                closeWork = w
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: w)
-            }
+            else { setExpanded(false) }   // closes at once when the pointer leaves
         } else {
             if s != screen { place(on: s) }
             let hotW = hover.notch.width + 20, hotH = max(hover.notch.height, 4)
             let hot = NSRect(x: f.midX - hotW / 2, y: f.maxY - hotH, width: hotW, height: hotH + 1)
-            if NSMouseInRect(p, hot, false) { setExpanded(true) }
+            // Opens only after the pointer rests 600 ms in the notch. A pass-through never opens it. A click is the second trigger.
+            if NSMouseInRect(p, hot, false) {
+                let t0 = dwellStart ?? Date()
+                dwellStart = t0
+                if Date().timeIntervalSince(t0) >= 0.6 { setExpanded(true, why: "rest-600ms") }
+            } else { dwellStart = nil }
         }
     }
 
-    func setExpanded(_ on: Bool) {
-        closeWork?.cancel(); closeWork = nil
+    // Every open is logged with its trigger: ~/Library/Logs/Awake-opens.log. The panel opens for no other reason.
+    func logOpen(_ why: String) {
+        let line = "\(ISO8601DateFormatter().string(from: Date())) open \(why)\n"
+        let f = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Awake-opens.log")
+        if let h = try? FileHandle(forWritingTo: f) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+        else { try? Data(line.utf8).write(to: f) }
+    }
+
+    func setExpanded(_ on: Bool, why: String = "") {
+        dwellStart = nil
         guard hover.expanded != on else { return }
+        if on { logOpen(why) }
         hover.expanded = on
         panel.ignoresMouseEvents = !on
         opsTimer?.invalidate(); opsTimer = nil
