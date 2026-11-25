@@ -148,56 +148,96 @@ final class Model: ObservableObject {
     }
 }
 
-// MARK: - Ops status (the agent dashboard, ~/.claude/ops/dashboard/server.py)
+// MARK: - Ops glance (ops-glance.py reads the board, the dispatcher and launchd; zero-base 25 Nov 2026)
 
-struct OpsStatus: Decodable {
-    struct Agent: Decodable { let name: String; let health: String; let progress: Double?; let done_today: Int; let next: String?; let waiting_on: [String]? }
-    struct Decisions: Decodable { struct Old: Decodable { let age_days: Int; let id: String?; let title: String? }; let count: Int; let oldest: [Old] }
-    struct Runner: Decodable { let ok: Bool; let age_min: Int? }
-    struct Triage: Decodable { let on: Bool; let stale: Bool? }
-    struct Jobs: Decodable { let failing: [String]? }
-    let agents: [Agent]; let decisions: Decisions; let runner: Runner; let triage: Triage; let jobs: Jobs
+struct Glance: Decodable {
+    struct Item: Decodable { let id: String; let kind: String; let text: String; let age_h: Double?; let open: String? }
+    struct Dispatch: Decodable {
+        let paused: Bool; let loaded: Bool; let ok: Bool; let last_tick: String?; let age_min: Int?
+        let live: Int; let max_live: Int?; let starts_today: Int; let max_day: Int?
+        let usd_today: Double; let usd_cap: Double?; let pause_file: String; let log: String?; let runs: String?
+    }
+    struct Job: Decodable { let label: String; let status: String; let log: String? }
+    struct Launchd: Decodable { let jobs: Int; let failed: [Job] }
+    let waiting: [Item]; let names_you: [String]; let digest: String?; let board: String
+    let dispatch: Dispatch; let launchd: Launchd; let closed_today: [String]
 }
 
-let opsURL = URL(string: "http://127.0.0.1:8788/")!
+// The script ships inside the app (build.sh copies it to Resources).
+let glanceScript = Bundle.main.path(forResource: "ops-glance", ofType: "py")
+    ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("src/Awake/ops-glance.py").path
 
 final class Ops: ObservableObject {
-    @Published private(set) var status: OpsStatus?
-    @Published private(set) var offline = false
+    @Published private(set) var g: Glance?
+    @Published private(set) var error: String?
     var onChange: (() -> Void)?
 
-    func refresh() {
-        var req = URLRequest(url: opsURL.appendingPathComponent("api/status"))
-        req.timeoutInterval = 4
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
-            let s = (resp as? HTTPURLResponse)?.statusCode == 200 ? data.flatMap { try? JSONDecoder().decode(OpsStatus.self, from: $0) } : nil
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.offline = s == nil           // a bad answer shows "offline", never stale numbers as fresh
-                if let s { self.status = s } else { self.status = nil }
-                self.onChange?()
-            }
-        }.resume()
+    static func load() -> (Glance?, String?) {
+        let p = Process(), out = Pipe(), err = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = [glanceScript]
+        p.standardOutput = out; p.standardError = err
+        do { try p.run() } catch { return (nil, "ops-glance did not start") }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        if p.terminationStatus != 0 {
+            let e = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return (nil, "ops-glance failed: " + (e.split(separator: "\n").last.map(String.init) ?? "exit \(p.terminationStatus)"))
+        }
+        do { return (try JSONDecoder().decode(Glance.self, from: data), nil) }
+        catch { return (nil, "ops-glance: bad JSON") }
     }
 
-    // orange: a decision older than 24 h or a stuck agent. red: runner down, triage should run but does not, or no answer at all.
+    // A failed read shows the error in red, never old numbers as fresh.
+    func refresh() {
+        DispatchQueue.global(qos: .utility).async {
+            let (g, e) = Ops.load()
+            DispatchQueue.main.async { self.g = g; self.error = e; self.onChange?() }
+        }
+    }
+
+    func setForSnapshot(_ g: Glance) { self.g = g }
+
+    func togglePause() {
+        guard let d = g?.dispatch else { return }
+        let fm = FileManager.default
+        if d.paused { try? fm.removeItem(atPath: d.pause_file) }
+        else { fm.createFile(atPath: d.pause_file, contents: Data("Paused from Awake \(ISO8601DateFormatter().string(from: Date()))\n".utf8)) }
+        refresh()
+    }
+
+    // orange: something waits on him, or a launchd job failed. red: the dispatcher is down or stale, or the read failed.
     enum Alert { case none, orange, red }
     var alert: Alert {
-        guard let s = status else { return offline ? .red : .none }
-        if !s.runner.ok || s.triage.stale == true { return .red }
-        if (s.decisions.oldest.first?.age_days ?? 0) >= 1 || s.agents.contains(where: { $0.health == "stuck" }) { return .orange }
+        guard let g else { return error == nil ? .none : .red }
+        if !g.dispatch.paused && !g.dispatch.ok { return .red }
+        if !g.waiting.isEmpty || !g.launchd.failed.isEmpty { return .orange }
         return .none
     }
 
-    var rows: Int { min(status?.agents.count ?? 0, 16) }
+    var rows: Int { min(g?.waiting.count ?? 0, maxRows) }
+}
+
+let maxRows = 6
+
+// Opens a file as text. A script is never run by a click.
+func openText(_ path: String?) {
+    guard let path, FileManager.default.fileExists(atPath: path) else { NSSound.beep(); return }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    p.arguments = ["-t", path]
+    try? p.run()
+}
+
+func ageText(_ h: Double?) -> String {
+    guard let h else { return "" }
+    return h < 1 ? "\(max(1, Int(h * 60))) m" : h < 48 ? "\(Int(h)) h" : "\(Int(h / 24)) d"
 }
 
 // MARK: - Notch panel
 
 final class Hover: ObservableObject {
     @Published var openH: CGFloat = 176
-    @Published var hovered: String?
-    var rowWork: DispatchWorkItem?
     @Published var expanded = false
     @Published var notch = CGSize(width: 200, height: 32)
     @Published var hasNotch = false
@@ -205,9 +245,12 @@ final class Hover: ObservableObject {
 
 let openW: CGFloat = 400
 let baseH: CGFloat = 176      // the sleep controls
-let statusH: CGFloat = 54     // the two summary lines
-let detailH: CGFloat = 52     // second-level detail under the list
-func opsHeight(_ ops: Ops) -> CGFloat { ops.status == nil ? 30 : statusH + CGFloat(ops.rows) * 18 + 6 + detailH }
+let rowH: CGFloat = 20
+func opsHeight(_ ops: Ops) -> CGFloat {
+    guard let g = ops.g else { return 30 }
+    let more: CGFloat = g.waiting.count > maxRows || !g.names_you.isEmpty ? rowH : 0
+    return 24 + CGFloat(ops.rows) * rowH + more + 14 + 4 * rowH + 8
+}
 
 struct NotchView: View {
     @ObservedObject var m: Model
@@ -250,82 +293,91 @@ struct NotchView: View {
         .preferredColorScheme(.dark)
     }
 
+    // Three questions: what needs me now, is the machine healthy, what closed today.
     var opsView: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if let s = ops.status {
-                let n = s.decisions.count, old = s.decisions.oldest.first?.age_days
-                HStack(spacing: 6) {
-                    Text(n == 0 ? "No decisions wait on you" : "\(n) decision\(n == 1 ? "" : "s") wait on you" + (old.map { $0 == 0 ? " (oldest today)" : " (oldest \($0) d)" } ?? ""))
-                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(n == 0 ? Color.green : .orange)
-                    Spacer()
-                    Text("open ›").font(.system(size: 11)).foregroundStyle(.secondary)
-                }
-                let failing = s.jobs.failing?.count ?? 0
-                HStack(spacing: 12) {
-                    flag("Runner", s.runner.ok ? "OK" : "down", s.runner.ok)
-                    flag("Triage", s.triage.on ? "on" : "off", s.triage.on)
-                    flag("Jobs", s.jobs.failing == nil ? "?" : failing == 0 ? "OK" : "\(failing) failing", s.jobs.failing != nil && failing == 0)
-                    Spacer()
-                }
-                .padding(.bottom, 2)
-                ForEach(Array(s.agents.prefix(16).enumerated()), id: \.offset) { _, a in
+        VStack(alignment: .leading, spacing: 0) {
+            if let g = ops.g {
+                let n = g.waiting.count
+                Button { openText(g.digest) } label: {
                     HStack(spacing: 6) {
-                        Circle().fill(color(a.health)).frame(width: 7, height: 7)
-                        Text(a.name).font(.system(size: 11)).lineLimit(1).frame(width: 130, alignment: .leading)
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(Color.white.opacity(0.12))
-                            GeometryReader { g in Capsule().fill(color(a.health)).frame(width: g.size.width * CGFloat(a.progress ?? 0)) }
-                        }.frame(height: 4)
-                        Text(a.progress.map { "\(Int($0 * 100))%" } ?? "n/a").font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 32, alignment: .trailing)
-                        Text("\(a.done_today) today").font(.system(size: 10)).foregroundStyle(a.done_today > 0 ? .white : .secondary).frame(width: 52, alignment: .trailing)
-                    }
-                    .frame(height: 18)
-                    .contentShape(Rectangle())
-                    .onHover { inside in h.rowWork?.cancel()
-                        if inside {   // second level only after the pointer rests 400 ms on the row
-                            let w = DispatchWorkItem { h.hovered = a.name }
-                            h.rowWork = w
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: w)
-                        } else if h.hovered == a.name { h.hovered = nil } }
+                        Text(n == 0 ? "Nothing waits on you" : "\(n) wait\(n == 1 ? "s" : "") on you" + (g.waiting.first?.age_h).map { " · oldest \(ageText($0))" }.orEmpty)
+                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(n == 0 ? Color.green : .orange)
+                        Spacer()
+                        Text("digest ›").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }.frame(height: 24).contentShape(Rectangle())
+                }.buttonStyle(.plain).help("Opens today's 08:15 digest")
+                ForEach(g.waiting.prefix(maxRows), id: \.id) { it in
+                    Button { openText(it.open) } label: {
+                        HStack(spacing: 6) {
+                            Text(it.kind).font(.system(size: 9, weight: .semibold)).foregroundStyle(.black)
+                                .padding(.horizontal, 5).frame(width: 62, height: 14)
+                                .background(Capsule().fill(it.kind == "yes?" ? Color.green : .orange))
+                            Text(it.id).font(.system(size: 11, weight: .medium).monospacedDigit()).frame(width: 36, alignment: .leading)
+                            Text(it.text).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                            Spacer(minLength: 4)
+                            Text(ageText(it.age_h)).font(.system(size: 10).monospacedDigit()).foregroundStyle(.secondary)
+                            Image(systemName: it.open == nil ? "minus" : "arrow.up.forward.square").font(.system(size: 10)).foregroundStyle(.secondary)
+                        }.frame(height: rowH).contentShape(Rectangle())
+                    }.buttonStyle(.plain).help(it.text + (it.open.map { "\nOpens " + $0 } ?? "\nNo file to open"))
                 }
-                detail(s)
+                if n > maxRows || !g.names_you.isEmpty {
+                    let more = max(0, n - maxRows)
+                    Button { openText(g.digest) } label: {
+                        Text((more > 0 ? "+\(more) more. " : "") + (g.names_you.isEmpty ? "" : "\(g.names_you.count) other board items name you as next step"))
+                            .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                            .frame(maxWidth: .infinity, minHeight: rowH, alignment: .leading).contentShape(Rectangle())
+                    }.buttonStyle(.plain).help(g.names_you.joined(separator: ", "))
+                }
+                Divider().overlay(Color.white.opacity(0.15)).padding(.vertical, 6)
+                machine(g)
             } else {
-                Text(ops.offline ? "Ops dashboard offline (127.0.0.1:8788)" : "Reading ops status...")
-                    .font(.system(size: 12)).foregroundStyle(ops.offline ? Color.red : .secondary)
+                Text(ops.error ?? "Reading ops status...")
+                    .font(.system(size: 12)).foregroundStyle(ops.error == nil ? Color.secondary : .red).lineLimit(1)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .onTapGesture { NSWorkspace.shared.open(opsURL) }
     }
 
-    // Second level: the oldest 3 decisions, or the next action and the wait of the hovered agent.
-    func detail(_ s: OpsStatus) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if let name = h.hovered, let a = s.agents.first(where: { $0.name == name }) {
-                Text("Next: " + ((a.next ?? "").isEmpty ? "none queued" : a.next!)).lineLimit(2)
-                Text("Waiting on: " + ((a.waiting_on ?? []).isEmpty ? "nobody" : a.waiting_on!.joined(separator: ", "))).lineLimit(1)
-            } else {
-                ForEach(Array(s.decisions.oldest.prefix(3).enumerated()), id: \.offset) { _, d in
-                    Text("\(d.age_days) d  \(d.title ?? d.id ?? "")").lineLimit(1)
-                }
-                if s.decisions.oldest.isEmpty { Text("No open decisions") }
-            }
+    func machine(_ g: Glance) -> some View {
+        let d = g.dispatch
+        let state = d.paused ? "paused" : !d.loaded ? "not loaded" : d.ok ? "on" : "stale"
+        let color: Color = d.paused ? .yellow : d.ok ? .green : .red
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Button { openText(d.log) } label: {
+                    HStack(spacing: 6) {
+                        Circle().fill(color).frame(width: 7, height: 7)
+                        Text("Dispatch \(state)").font(.system(size: 11, weight: .medium))
+                        Text("· last \(d.last_tick ?? "never") · \(d.live)/\(d.max_live.map(String.init) ?? "?") live")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain).help("Opens dispatch.log")
+                Spacer()
+                Button(action: ops.togglePause) {
+                    Label(d.paused ? "Resume" : "Pause", systemImage: d.paused ? "play.fill" : "pause.fill")
+                        .font(.system(size: 10, weight: .medium)).padding(.horizontal, 8).frame(height: 18)
+                        .background(Capsule().fill(Color.white.opacity(0.12)))
+                }.buttonStyle(.plain).help(d.paused ? "Removes PAUSE-DISPATCH" : "Creates PAUSE-DISPATCH (the kill switch)")
+            }.frame(height: rowH)
+            line(d.usd_cap.map { d.usd_today > $0 * 0.8 } ?? false ? .orange : .green,
+                 String(format: "Today $%.2f", d.usd_today) + (d.usd_cap.map { String(format: " of $%.0f cap", $0) } ?? "")
+                 + " · \(d.starts_today)/\(d.max_day.map(String.init) ?? "?") starts", d.runs)
+            let f = g.launchd.failed
+            line(f.isEmpty ? .green : .red, f.isEmpty ? "launchd: \(g.launchd.jobs) jobs OK"
+                 : "launchd: \(f.count) failed: " + f.map { "\($0.label) (\($0.status))" }.joined(separator: ", "), f.first?.log)
+            line(g.closed_today.isEmpty ? .gray : .green, "Judge PASS today: \(g.closed_today.count)"
+                 + (g.closed_today.isEmpty ? "" : " · " + g.closed_today.joined(separator: ", ")), g.board)
         }
-        .font(.system(size: 10)).foregroundStyle(.secondary)
-        .frame(maxWidth: .infinity, minHeight: detailH - 8, maxHeight: detailH - 8, alignment: .topLeading)
-        .padding(.top, 6)
     }
 
-    func color(_ health: String) -> Color {
-        switch health { case "earning": return .green; case "quiet": return .yellow; case "stuck", "error": return .red; default: return .gray }
-    }
-
-    func flag(_ title: String, _ value: String, _ ok: Bool) -> some View {
-        HStack(spacing: 4) {
-            Circle().fill(ok ? Color.green : .red).frame(width: 6, height: 6)
-            Text("\(title) \(value)").font(.system(size: 11)).foregroundStyle(.secondary)
-        }
+    func line(_ c: Color, _ text: String, _ path: String?) -> some View {
+        Button { if path != nil { openText(path) } } label: {
+            HStack(spacing: 6) {
+                Circle().fill(c).frame(width: 7, height: 7)
+                Text(text).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                Spacer()
+            }.frame(height: rowH).contentShape(Rectangle())
+        }.buttonStyle(.plain).disabled(path == nil).help(path.map { "Opens " + $0 } ?? "")
     }
 
     var content: some View {
@@ -383,6 +435,8 @@ struct NotchView: View {
         .buttonStyle(.plain)
     }
 }
+
+extension Optional where Wrapped == String { var orEmpty: String { self ?? "" } }
 
 final class Panel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -500,6 +554,22 @@ final class App: NSObject, NSApplicationDelegate {
             opsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.ops.refresh() }
         }
     }
+}
+
+// Awake --snapshot <file.png>: renders the open panel with live numbers to a PNG and exits. For checks and judges.
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--snapshot" {
+    let m = Model(), h = Hover(), ops = Ops()
+    let (g, e) = Ops.load()
+    if let g { ops.setForSnapshot(g) } else { FileHandle.standardError.write(Data((e ?? "load failed").utf8)); exit(1) }
+    h.expanded = true; h.notch = CGSize(width: 200, height: 32); h.hasNotch = true
+    h.openH = baseH + opsHeight(ops) + 48
+    MainActor.assumeIsolated {
+        let r = ImageRenderer(content: NotchView(m: m, h: h, ops: ops).environment(\.colorScheme, .dark).background(Color(white: 0.2)))
+        r.scale = 2
+        guard let cg = r.cgImage, let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) else { exit(1) }
+        try! png.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
+    }
+    exit(0)
 }
 
 let app = NSApplication.shared
