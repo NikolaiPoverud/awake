@@ -159,8 +159,11 @@ struct Glance: Decodable {
     }
     struct Job: Decodable { let label: String; let status: String; let log: String? }
     struct Launchd: Decodable { let jobs: Int; let failed: [Job] }
+    struct Card: Decodable { let id: String; let type: String; let state: String; let summary: String; let does: String
+                             let age_h: Double?; let error: String?; let open: String? }
     let waiting: [Item]; let names_you: [String]; let digest: String?; let board: String
     let dispatch: Dispatch; let launchd: Launchd; let closed_today: [String]
+    let cards: [Card]; let max_cards: Int?; let card_approve: String
 }
 
 // The script ships inside the app (build.sh copies it to Resources).
@@ -198,6 +201,33 @@ final class Ops: ObservableObject {
 
     func setForSnapshot(_ g: Glance) { self.g = g }
 
+    // Decision cards (queue design 25 Nov 2026). A button runs bin/card-approve; his click is the approval (the script logs it).
+    @Published var cardBusy: Set<String> = []
+    @Published var armed: String? = nil
+    func arm(_ key: String) -> Bool {
+        if armed == key { armed = nil; return true }
+        armed = key
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in if self?.armed == key { self?.armed = nil } }
+        return false
+    }
+    @Published var cardMsg: [String: String] = [:]
+    func card(_ id: String, _ args: [String]) {
+        guard let path = g?.card_approve, !cardBusy.contains(id) else { NSSound.beep(); return }
+        cardBusy.insert(id); cardMsg[id] = args.isEmpty ? "approving..." : args[0] == "--kill" ? "killing..." : "opening..."
+        DispatchQueue.global(qos: .userInitiated).async {
+            let p = Process(), out = Pipe()
+            p.executableURL = URL(fileURLWithPath: path); p.arguments = [id] + args
+            p.environment = ProcessInfo.processInfo.environment.merging(["CARD_BY": "nikolai (Awake click)"]) { $1 }
+            p.standardOutput = out; p.standardError = out
+            var msg = "did not start"
+            if (try? p.run()) != nil {
+                let d = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+                msg = String(data: d, encoding: .utf8)?.split(separator: "\n").last.map(String.init) ?? "exit \(p.terminationStatus)"
+            }
+            DispatchQueue.main.async { self.cardBusy.remove(id); self.cardMsg[id] = msg; self.refresh() }
+        }
+    }
+
     func togglePause() {
         guard let d = g?.dispatch else { return }
         let fm = FileManager.default
@@ -211,7 +241,7 @@ final class Ops: ObservableObject {
     var alert: Alert {
         guard let g else { return error == nil ? .none : .red }
         if !g.dispatch.paused && !g.dispatch.ok { return .red }
-        if !g.waiting.isEmpty || !g.launchd.failed.isEmpty { return .orange }
+        if !g.cards.isEmpty || !g.waiting.isEmpty || !g.launchd.failed.isEmpty { return .orange }
         return .none
     }
 
@@ -219,6 +249,7 @@ final class Ops: ObservableObject {
 }
 
 let maxRows = 6
+let maxCardRows = 5
 
 // Opens a file as text. A script is never run by a click.
 func openText(_ path: String?) {
@@ -249,7 +280,9 @@ let rowH: CGFloat = 20
 func opsHeight(_ ops: Ops) -> CGFloat {
     guard let g = ops.g else { return 30 }
     let more: CGFloat = g.waiting.count > maxRows || !g.names_you.isEmpty ? rowH : 0
-    return 24 + CGFloat(ops.rows) * rowH + more + 14 + 4 * rowH + 8
+    let nc = min(g.cards.count, maxCardRows)
+    let cardsH: CGFloat = 24 + CGFloat(nc) * (2 * rowH + 6) + (g.cards.count > maxCardRows ? rowH : 0) + 8
+    return cardsH + 24 + CGFloat(ops.rows) * rowH + more + 14 + 4 * rowH + 8
 }
 
 struct NotchView: View {
@@ -293,10 +326,63 @@ struct NotchView: View {
         .preferredColorScheme(.dark)
     }
 
+    // Approve and Kill need a second click within 4 s, so a pass of the pointer never sends.
+    var armed: String? { ops.armed }
+    func arm(_ key: String) -> Bool { ops.arm(key) }
+
+    func cardButton(_ title: String, _ icon: String, _ tint: Color, _ armedNow: Bool, help: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(armedNow ? "Sure?" : title, systemImage: icon).font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(armedNow ? Color.black : tint).padding(.horizontal, 7).frame(height: 18)
+                .background(Capsule().fill(armedNow ? tint : Color.white.opacity(0.12)))
+        }.buttonStyle(.plain).help(help)
+    }
+
+    func cardsView(_ g: Glance) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            let n = g.cards.count, cap = g.max_cards ?? 10
+            HStack(spacing: 6) {
+                Text(n == 0 ? "No cards to decide" : "\(n) card\(n == 1 ? "" : "s") to decide")
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(n == 0 ? Color.green : n >= cap ? .red : .orange)
+                Spacer()
+                Text("cap \(cap)" + (n >= cap ? " · dispatch holds" : "")).font(.system(size: 11)).foregroundStyle(n >= cap ? .red : .secondary)
+            }.frame(height: 24)
+            ForEach(g.cards.prefix(maxCardRows), id: \.id) { c in
+                let busy = ops.cardBusy.contains(c.id)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(c.type).font(.system(size: 9, weight: .semibold)).foregroundStyle(.black)
+                            .padding(.horizontal, 5).frame(width: 74, height: 14).background(Capsule().fill(c.state == "failed" ? Color.red : Color.green))
+                        Text(c.id).font(.system(size: 11, weight: .medium).monospacedDigit()).frame(width: 40, alignment: .leading)
+                        Text(c.summary).font(.system(size: 11)).lineLimit(1).help(c.summary)
+                        Spacer(minLength: 4)
+                        Text(ageText(c.age_h)).font(.system(size: 10).monospacedDigit()).foregroundStyle(.secondary)
+                    }.frame(height: rowH)
+                    HStack(spacing: 6) {
+                        let note = ops.cardMsg[c.id] ?? c.error ?? (c.state == "queued" ? "approved, sends at 06:30" : "runs: " + c.does)
+                        Text(note).font(.system(size: 10)).foregroundStyle(c.error != nil && ops.cardMsg[c.id] == nil ? Color.red : .secondary)
+                            .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 4).help(note)
+                        if busy { ProgressView().controlSize(.mini) }
+                        cardButton("Approve", "checkmark", .green, armed == "a" + c.id, help: "Runs: \(c.does). Click twice. Re-judges first if the text changed.") {
+                            if arm("a" + c.id) { ops.card(c.id, []) } }.disabled(busy || c.state == "queued")
+                        cardButton("Edit", "pencil", .white, false, help: "Opens the text. Approve after an edit re-judges it.") { ops.card(c.id, ["--edit"]) }.disabled(busy)
+                        cardButton("Kill", "xmark", .red, armed == "k" + c.id, help: "Closes the card and drops the item. Click twice.") {
+                            if arm("k" + c.id) { ops.card(c.id, ["--kill", "killed in Awake"]) } }.disabled(busy)
+                    }.frame(height: rowH)
+                }.padding(.bottom, 6)
+            }
+            if n > maxCardRows {
+                Text("+\(n - maxCardRows) more: card-approve --list").font(.system(size: 10)).foregroundStyle(.secondary).frame(height: rowH)
+            }
+            Divider().overlay(Color.white.opacity(0.15)).padding(.top, 2).padding(.bottom, 6)
+        }
+    }
+
     // Three questions: what needs me now, is the machine healthy, what closed today.
     var opsView: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let g = ops.g {
+                cardsView(g)
                 let n = g.waiting.count
                 Button { openText(g.digest) } label: {
                     HStack(spacing: 6) {
@@ -570,6 +656,18 @@ if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--snapshot" {
         try! png.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
     }
     exit(0)
+}
+
+// Awake --card <id> [--edit | --kill why]: runs the same Ops.card call the card buttons run (Process, env, last output line), prints
+// the line the panel would show, and exits. For checks: the buttons themselves only add the second-click guard in front of this.
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--card" {
+    let ops = Ops(), id = CommandLine.arguments[2], rest = Array(CommandLine.arguments.dropFirst(3))
+    let (g, e) = Ops.load()
+    guard let g else { FileHandle.standardError.write(Data((e ?? "load failed").utf8)); exit(1) }
+    ops.setForSnapshot(g)
+    ops.card(id, rest)
+    while ops.cardBusy.contains(id) { RunLoop.main.run(until: Date().addingTimeInterval(0.2)) }
+    print(ops.cardMsg[id] ?? "no message"); exit(0)
 }
 
 let app = NSApplication.shared

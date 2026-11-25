@@ -8,6 +8,8 @@
 #                dispatch/runs.jsonl (local today), caps parsed from bin/dispatch, StartInterval from the LaunchAgent plist.
 #   launchd      launchctl list: every com.catalystone.* job whose last exit status is not 0. Log = StandardErrorPath of its plist.
 #   closed_today board.jsonl: status done or draft-ready, updated today (local), evidence carries "judge PASS".
+#   cards        cards/<id>.json with state open, queued or failed (queue design 25 Nov): type, summary, what Approve runs, body file,
+#                age, last error. The panel's Approve / Edit / Kill buttons run CARD_APPROVE (bin/card-approve); max_cards from bin/_chat.py.
 # Check: ./check-status.sh (runs this on a fixture folder and asserts every number).
 import json, os, re, glob, plistlib, subprocess, datetime as dt
 OPS = os.environ.get("OPS_DIR") or os.path.expanduser("~/.claude/ops")
@@ -110,7 +112,23 @@ for label, j in sorted(jobs.items()):
 closed = sorted(i["id"] for i in board.values() if i.get("status") in ("done", "draft-ready")
                 and local_day(i.get("updated")) == today and "judge PASS" in (i.get("evidence") or ""))
 
+cards = []
+for f in sorted(glob.glob(P("cards", "*.json"))):
+    try: c = json.load(open(f))
+    except (OSError, ValueError): continue
+    if c.get("state") not in ("open", "queued", "failed"): continue
+    u = ts(c.get("created")); acts = c.get("actions") or []
+    does = ", ".join({"teams_send_chat_message": "Teams chat", "teams_reply_channel_message": "Teams reply", "teams_send_channel_message": "Teams post",
+                      "outlook_send_mail": "mail", "merge": "merge", "command": "command", "decision": "yes"}.get(a.get("kind"), a.get("kind") or "?") for a in acts)
+    cards.append({"id": c.get("id"), "type": c.get("type") or "other", "state": c["state"], "summary": short(c.get("summary") or c.get("ask"), 200),
+                  "does": does, "age_h": round((now - u).total_seconds() / 3600, 1) if u else None, "error": short(c.get("last_error"), 160) or None,
+                  "open": next((a["body_file"] for a in acts if ex(a.get("body_file"))), None) or f})
+cards.sort(key=lambda c: -(c["age_h"] or 0))
+mc = re.search(r"MAX_CARDS = (\d+)", open(P("bin", "_chat.py")).read()) if ex(P("bin", "_chat.py")) else None
+wait = [w for w in wait if w["id"] not in {c["id"] for c in cards}]
+
 digest = ex(P("digest", today.isoformat() + ".md"))
 print(json.dumps({"now": dt.datetime.now().strftime("%H:%M"), "waiting": wait, "names_you": names_you, "digest": digest,
                   "board": P("board.jsonl"), "dispatch": dispatch, "launchd": {"jobs": len(jobs), "failed": failed},
-                  "closed_today": closed}, ensure_ascii=False))
+                  "closed_today": closed, "cards": cards, "max_cards": int(mc[1]) if mc else None,
+                  "card_approve": P("bin", "card-approve")}, ensure_ascii=False))
